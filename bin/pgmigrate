@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -e
+
+# source .env
+
+export PGPASSWORD=${PGPASSWORD:-"1likepants"}
+
+dropdb -U postgres chain || true;
+createdb -U postgres chain || true;
+
+echo $PGPASSWORD;
+for file in ./sql/migrate/$1*; do
+  psql -a  \
+    -d "chain" \
+    -U "postgres" \
+    -f "${file}"
+done

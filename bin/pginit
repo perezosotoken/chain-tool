@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -e
+
+source .env
+
+sql="../sql/schema.sql"
+
+psql -a  \
+  -h 'localhost' \
+  -d 'chain' \
+  -U 'postgres' \
+  -p 5432 < $sql

@@ -1,0 +1,269 @@
+const { db, utils } = require("../lib/common");
+
+const synthetix = require("@oikos/oikos-bsc");
+const web3 = require("web3");
+const ethers = require("ethers");
+
+const toBN = ({ _hex }) => ethers.utils.bigNumberify(_hex);
+
+const tronNetwork = process.env.TRON_NETWORK || "bsc";
+
+const getContractTarget = ({ network = tronNetwork, address }) => {
+  const targets = synthetix.getTarget({ network });
+  return Object.keys(targets)
+    .map((key) => targets[key])
+    .find((t) => t.address == address);
+};
+
+const formatRow = (row) => {
+  const parsedData = JSON.parse(row.data);
+  const params = Object.keys(parsedData)
+    .filter((key) => !key.match(/^[0-9]+$/))
+    .filter((key) => key !== "__length__")
+    .reduce((acc, key) => {
+      let val = parsedData[key];
+      if (typeof val === "object" && "_hex" in val) {
+        val = toBN(val);
+      }
+      if (["amount", "value", "fromAmount", "toAmount"].includes(key)) {
+        val = parseFloat(ethers.utils.formatUnits(val, 18));
+      }
+      try {
+        val = val.toNumber();
+      } catch (err) {}
+      if (["fromCurrencyKey", "toCurrencyKey"].includes(key)) {
+        val = web3.utils.toUtf8(val);
+      }
+      return { ...acc, [key]: val };
+    }, {});
+
+  const contractAddress = row.contract_address;
+  // TODO: move this to libexec/block.js and save as field in extracted.logs
+  // table (so that the info is not lost when we re-deploy new contracts)
+
+  const target = getContractTarget({ address: contractAddress });
+  // todo: retrieve contract name so we can set token prop
+  return {
+    _id: row.id,
+    transactionHash: row.transaction_hash,
+    from: row.address,
+    fromAddress: row.address,
+    // toAddress: TODO
+    event: row.event_name,
+    blockTimestampDate: row.block_timestamp,
+    blockTimestamp: +row.block_timestamp,
+    blockNumber: row.block_number,
+    blockHash: row.block_hash,
+    logIndex: row.log_index,
+    topics: row.topics,
+    contract: target ? target.name : "Unknown",
+    createdAt: row.block_timestamp,
+    modifiedAt: row.block_timestamp,
+    ...params,
+    ...(() => {
+      if (
+        ["SynthDeposit", "SynthDepositRemoved", "SynthWithdrawal"].includes(
+          row.event_name
+        )
+      ) {
+        return {
+          // TODO: where we get the "token" value from??
+          token: "TODO?",
+          value: params.amount,
+        };
+      }
+      if (["SynthExchange"].includes(row.event_name)) {
+        return {
+          exchangeFromCurrency: params.fromCurrencyKey,
+          exchangeToCurrency: params.toCurrencyKey,
+          exchangeFromAmount: params.fromAmount,
+          exchangeToAmount: params.toAmount,
+        };
+      }
+      return {};
+    })(),
+  };
+};
+
+const getEventsByName = async (eventName) => {
+  const whereClausole = ` block.timestamp::date >= current_date - INTERVAL '15 DAY'`;
+
+  const rows = await db.query(
+    `
+    select
+      logs.*,
+      transaction.hash as transaction_hash,
+      transaction.to_address as contract_address,
+      block.timestamp as block_timestamp,
+      block.number as block_number,
+      block.hash as block_hash
+    from extracted.logs
+    left join
+      vulcan2x.transaction on vulcan2x.transaction.id = logs.tx_id
+    left join
+      vulcan2x.block on vulcan2x.block.id = logs.block_id
+    where event_name = $1 and ${whereClausole}
+     limit $2
+    `,
+    //ORDER BY block_timestamp DESC
+    [eventName, 1000]
+  );
+
+  console.log(    `
+  select
+    logs.*,
+    transaction.hash as transaction_hash,
+    transaction.to_address as contract_address,
+    block.timestamp as block_timestamp,
+    block.number as block_number,
+    block.hash as block_hash
+  from extracted.logs
+  left join
+    vulcan2x.transaction on vulcan2x.transaction.id = logs.tx_id
+  left join
+    vulcan2x.block on vulcan2x.block.id = logs.block_id
+  where event_name =${eventName}  
+  limit 4999
+  `);
+  
+  const events = rows.map(formatRow);
+  console.log(events)
+  return events;
+};
+
+const getEventsFiltered = async ({
+  eventName,
+  fromAddress,
+  toAddress,
+  limit,
+  mostRecent = false,
+  eventWhitelist = [
+    "Issued",
+    "Burned",
+    "FeesClaimed",
+    "SynthExchange",
+    "SynthDeposit",
+    "SynthWithdrawal",
+    "ClearedDeposit",
+    "Exchange",
+  ],
+}) => {
+  let where = [
+    ["event_name", eventName],
+    ["address", fromAddress],
+    ["logs.to_address", toAddress],
+  ].filter(([_, val]) => val);
+
+  const args = [];
+
+  const whereCols = where.map(([col, val], idx) => {
+    args.push(val);
+    return `${col} = $${args.length}`;
+  });
+
+  let whereByEventWhitelist = [];
+  if (!eventName) {
+    whereByEventWhitelist = eventWhitelist.map((eventName) => {
+      args.push(eventName);
+      return `$${args.length}`;
+    });
+  }
+
+  const whereSegments = [...whereCols];
+
+  if (whereByEventWhitelist.length) {
+    whereSegments.push(`event_name in (${whereByEventWhitelist.join(",")})`);
+  }
+
+  args.push(limit);
+
+  // Sets tx_is_exchange = 1 if transaction contains a SynthExchange event
+  const txIsExchangeJoin = `
+    left join (
+      select
+        tx_id,
+        SUM(CASE WHEN event_name='SynthExchange' THEN 1 ELSE 0 END) AS tx_is_exchange
+      from extracted.logs
+      group by tx_id
+    ) as t2
+    on t2.tx_id = logs.tx_id
+  `;
+  // Exclude events that are part of a transaction which contains a
+  // SynthExchange event
+  const txIsExchangeWhereCond = `
+		((tx_is_exchange = 1 AND event_name = 'SynthExchange')
+		OR (tx_is_exchange = 0))
+  `;
+
+  whereSegments.push(txIsExchangeWhereCond);
+  const whereClausole = ` and block.timestamp::date >= current_date - INTERVAL '15 DAY'`;
+
+  const sql = `
+    select
+      logs.*,
+      transaction.hash as transaction_hash,
+      transaction.to_address as contract_address,
+      block.timestamp as block_timestamp,
+      block.number as block_number,
+      block.hash as block_hash,
+      tx_is_exchange
+    from extracted.logs as logs
+    ${txIsExchangeJoin}
+    left join
+      vulcan2x.transaction on vulcan2x.transaction.id = logs.tx_id
+    left join
+      vulcan2x.block on vulcan2x.block.id = logs.block_id
+      ${
+        whereSegments.length
+          ? `where ${whereSegments.join(" and ")} ${
+              mostRecent ? whereClausole : ""
+            }`
+          : ``
+      }
+       limit $${args.length}
+  `;
+  console.log(sql);
+  console.log(args);
+  const rows = await db.query(sql, args);
+  console.log(rows);
+  const events = rows.map(formatRow);
+  return events;
+};
+
+module.exports = { getEventsByName, getEventsFiltered };
+
+const test = async () => {
+  /*
+  {
+    const events = await getEventsByName("Transfer");
+    console.log(events);
+  }
+  {
+    const fromAddress = "41a8a07f09def5e6a4462df90068c11abf6224e865";
+    const events = await getEventsFiltered({
+      eventName: "SynthDeposit",
+      fromAddress,
+    });
+    console.log(events);
+  }
+  */
+  {
+    /*
+    const events = await getEventsFiltered({
+      eventName: "SynthExchange",
+    });
+    */
+    /*
+    const events = await getEventsFiltered({
+      fromAddress: "41a8a07f09def5e6a4462df90068c11abf6224e865",
+    });
+    */
+    const events = await getEventsFiltered({});
+    console.log(events);
+  }
+};
+
+// test
+if (require.main === module) {
+  test().catch(console.error);
+}

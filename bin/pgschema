@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+echo "Dumping schema to sql/schema.sql"
+
+//source .env
+
+pg_dump -vc \
+  --schema-only \
+  --no-owner \
+  --no-privileges \
+  -f schema.sql \
+  -U 'postgres' \
+  -d 'chain'
+  
+cat schema.sql

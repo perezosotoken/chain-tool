@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+psql --set=sslmode=require \
+  -h "localhost" \
+  -d "chain" \
+  -U "postgres" \
+  -p 5432
